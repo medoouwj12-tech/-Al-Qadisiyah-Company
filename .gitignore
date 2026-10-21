@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+raw_materials.db
+raw_materials.db-shm
+raw_materials.db-wal
+backups/
+.venv/
+venv/
+.env
+.vercel/
