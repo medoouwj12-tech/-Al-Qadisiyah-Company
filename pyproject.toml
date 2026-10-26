@@ -1,0 +1,12 @@
+[project]
+name = "al-qadisiyah-company"
+version = "1.0.0"
+description = "نظام إدارة مخزون القادسية لتجارة مواد خام البلاستيك"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.117.1,<1",
+  "psycopg[binary]>=3.2,<4",
+]
+
+[tool.vercel.scripts]
+build = "python build.py"

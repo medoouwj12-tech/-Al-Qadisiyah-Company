@@ -9,8 +9,10 @@ import argparse
 from contextlib import contextmanager
 import hashlib
 import hmac
+import io
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -22,20 +24,126 @@ from pathlib import Path
 from typing import Iterator
 from urllib.parse import urlparse
 
+try:
+    import psycopg as _psycopg
+    _INTEGRITY_ERROR = _psycopg.IntegrityError
+except ImportError:
+    _INTEGRITY_ERROR = sqlite3.IntegrityError
+
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("RAKHAM_DB", ROOT / "raw_materials.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 BACKUP_DIR = Path(os.environ.get("RAKHAM_BACKUPS", ROOT / "backups"))
 SESSION_TTL = 60 * 60 * 12
 DEFAULT_PERMISSIONS = {"materials.read": True, "purchases.create": True,
                        "sales.create": True, "movements.read_own": True}
 
 
+class _PgRow(dict):
+    """A small row adapter that preserves sqlite.Row's integer indexing."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return tuple(self.values())[key]
+        return super().__getitem__(key)
+
+
+class _PgCursor:
+    _ID_TABLES = {"users", "suppliers", "customers", "materials", "movements", "audit_log"}
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def execute(self, query, params=()):
+        query = query.strip()
+        # SQLite tuning pragmas have no PostgreSQL equivalent and must not be
+        # sent to Neon (initialize() calls these for both local and cloud DBs).
+        if re.match(r"PRAGMA\s+(?:journal_mode|foreign_keys|busy_timeout)\b", query, re.I):
+            return self
+        if query.upper() == "BEGIN IMMEDIATE":
+            query = "BEGIN"
+        table_info = re.fullmatch(r"PRAGMA\s+table_info\((\w+)\)", query, re.I)
+        if table_info:
+            self._cursor.execute(
+                "SELECT ordinal_position - 1 AS cid, column_name AS name, data_type AS type, "
+                "0 AS \"notnull\", column_default AS dflt_value, 0 AS pk "
+                "FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=%s "
+                "ORDER BY ordinal_position", (table_info.group(1),))
+            return self
+        query = re.sub(r"date\('now','-6 days'\)", "(CURRENT_DATE - 6)::text", query, flags=re.I)
+        query = re.sub(r"date\(created_at\)", "created_at::date", query, flags=re.I)
+        query = re.sub(r"created_at::date\s+BETWEEN\s+\?\s+AND\s+\?",
+                       "created_at::date BETWEEN %s::date AND %s::date", query, flags=re.I)
+        query = re.sub(r"created_at::date\s*=\s*\?", "created_at::date=%s::date", query, flags=re.I)
+        query = re.sub(r"=\s*CURRENT_TIMESTAMP\b", "=CURRENT_TIMESTAMP::text", query, flags=re.I)
+        ignored = bool(re.match(r"INSERT\s+OR\s+IGNORE\s+INTO\s+", query, re.I))
+        query = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO\s+", "INSERT INTO ", query, flags=re.I)
+        inserted = re.match(r"INSERT\s+INTO\s+(\w+)", query, re.I)
+        wants_id = bool(inserted and inserted.group(1).lower() in self._ID_TABLES
+                        and not re.search(r"\bRETURNING\b", query, re.I))
+        if wants_id:
+            query += " RETURNING id"
+        elif ignored:
+            query += " ON CONFLICT DO NOTHING"
+        query = query.replace("?", "%s")
+        self._cursor.execute(query, params)
+        if wants_id:
+            row = self._cursor.fetchone()
+            self.lastrowid = row["id"] if row else None
+        return self
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return _PgRow(row) if row is not None else None
+
+    def fetchall(self):
+        return [_PgRow(row) for row in self._cursor.fetchall()]
+
+
+class _PgConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, query, params=()):
+        cursor = _PgCursor(self._connection.cursor())
+        return cursor.execute(query, params)
+
+    def executescript(self, script):
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if statement and not statement.upper().startswith("PRAGMA "):
+                statement = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\b", "BIGSERIAL PRIMARY KEY", statement, flags=re.I)
+                statement = re.sub(r"\bINTEGER(\s+(?:NOT\s+NULL\s+)?)REFERENCES\b", r"BIGINT\1REFERENCES", statement, flags=re.I)
+                statement = re.sub(r"DEFAULT\s+CURRENT_TIMESTAMP\b", "DEFAULT (CURRENT_TIMESTAMP::text)", statement, flags=re.I)
+                self.execute(statement)
+
+    def commit(self):
+        self._connection.commit()
+
+    def rollback(self):
+        self._connection.rollback()
+
+    def close(self):
+        self._connection.close()
+
+
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
-    db = sqlite3.connect(DB_PATH, timeout=15)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys=ON")
-    db.execute("PRAGMA busy_timeout=15000")
+    if os.environ.get("VERCEL") and not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is required on Vercel; configure the Neon integration first")
+    if DATABASE_URL:
+        import psycopg
+        from psycopg.rows import dict_row
+        db = _PgConnection(psycopg.connect(DATABASE_URL, row_factory=dict_row))
+    else:
+        db = sqlite3.connect(DB_PATH, timeout=15)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA busy_timeout=15000")
     try:
         yield db
         db.commit()
@@ -62,7 +170,8 @@ def check_password(password: str, saved: str) -> bool:
 
 
 def initialize() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not DATABASE_URL:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect() as db:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript("""
@@ -121,7 +230,7 @@ def initialize() -> None:
         for name, decl in (("email", "TEXT DEFAULT ''"), ("address", "TEXT DEFAULT ''"),
                            ("country", "TEXT DEFAULT ''"), ("active", "INTEGER NOT NULL DEFAULT 1")):
             if name not in columns:
-                db.execute(f"ALTER TABLE suppliers ADD COLUMN {name} {decl}")
+                db.execute(f"ALTER TABLE suppliers ADD COLUMN {'IF NOT EXISTS ' if DATABASE_URL else ''}{name} {decl}")
         material_cols = {r[1] for r in db.execute("PRAGMA table_info(materials)")}
         if "warehouse_id" not in material_cols:
             db.execute("ALTER TABLE materials ADD COLUMN warehouse_id INTEGER REFERENCES warehouses(id)")
@@ -133,6 +242,15 @@ def initialize() -> None:
         movement_cols = {r[1] for r in db.execute("PRAGMA table_info(movements)")}
         if "reference" not in movement_cols:
             db.execute("ALTER TABLE movements ADD COLUMN reference TEXT DEFAULT ''")
+        if DATABASE_URL:
+            db.execute("SELECT pg_advisory_xact_lock(782336)")
+        username = os.environ.get("INITIAL_ADMIN_USERNAME", "").strip()
+        display_name = os.environ.get("INITIAL_ADMIN_DISPLAY_NAME", "").strip()
+        password = os.environ.get("INITIAL_ADMIN_PASSWORD", "")
+        if username and display_name and len(password) >= 12:
+            if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+                db.execute("INSERT INTO users(username,display_name,password_hash,role,permissions) VALUES(?,?,?,'manager','{}')",
+                           (username, display_name, password_hash(password)))
 
 
 def create_manager(username: str, display_name: str, password: str) -> None:
@@ -168,7 +286,9 @@ class AppHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_static(self, path: str) -> None:
-        file = ROOT / ("index.html" if path in ("/", "/index.html") else path.lstrip("/"))
+        relative = "index.html" if path in ("/", "/index.html") else path.lstrip("/")
+        public_root = ROOT / "public"
+        file = (public_root if public_root.is_dir() else ROOT) / relative
         if not file.is_file() or ROOT.resolve() not in file.resolve().parents:
             self.send_error(404); return
         body = file.read_bytes()
@@ -424,7 +544,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         if prior["user_id"]!=user["id"] or prior["request_hash"]!=req_hash:
                             self.send_json({"error":"تم استخدام مفتاح العملية لطلب مختلف"},409); return
                         self.send_json({"ok":True,"id":prior["movement_id"],"duplicate":True},200); return
-                    material=db.execute("SELECT * FROM materials WHERE id=?",(mid,)).fetchone()
+                    lock_clause = " FOR UPDATE" if DATABASE_URL else ""
+                    material=db.execute("SELECT * FROM materials WHERE id=?" + lock_clause,(mid,)).fetchone()
                     if not material: self.send_json({"error":"الخامة غير موجودة"},404); return
                     party=str(data.get("party","")).strip()
                     if typ=="receipt":
@@ -447,13 +568,15 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.send_json({"ok":True,"id":cur.lastrowid},201); return
                 if path == "/api/backups":
                     if not self.require_manager(): return
+                    if DATABASE_URL:
+                        self.send_json({"error": "النسخ الاحتياطي لقاعدة Neon يُدار من إعدادات Neon"}, 501); return
                     BACKUP_DIR.mkdir(parents=True,exist_ok=True)
                     target=BACKUP_DIR / f"raw_materials-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
                     with connect() as source, sqlite3.connect(target) as dest: source.backup(dest)
                     self.audit(db,user,"backup","database",target.name)
                     db.commit()
                     self.send_json({"ok":True,"file":target.name},201); return
-        except sqlite3.IntegrityError as exc:
+        except _INTEGRITY_ERROR as exc:
             message="اسم المستخدم أو كود الصنف مستخدم بالفعل" if "UNIQUE" in str(exc) else "تعذر حفظ البيانات بسبب ارتباط غير صالح"
             self.send_json({"error":message},409); return
         except (ValueError,TypeError,OverflowError):
@@ -479,3 +602,67 @@ def main() -> None:
 
 if __name__=="__main__":
     main()
+
+
+try:
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI, Request
+    from starlette.responses import Response
+
+    class _VercelHandler(AppHandler):
+        """Bridge a FastAPI request into the existing local HTTP handler."""
+        def __init__(self, request, body: bytes):
+            self.command = request.method
+            self.path = request.url.path
+            self.headers = request.headers
+            self.client_address = (request.client.host if request.client else "", 0)
+            self.rfile = io.BytesIO(body)
+            self.wfile = io.BytesIO()
+            self.response_status = 200
+            self.response_headers = {}
+
+        def send_response(self, code, message=None):
+            self.response_status = code
+
+        def send_header(self, keyword, value):
+            self.response_headers[keyword] = value
+
+        def end_headers(self):
+            pass
+
+        def send_error(self, code, message=None, explain=None):
+            self.response_status = code
+            self.response_headers["Content-Type"] = "text/plain; charset=utf-8"
+            self.wfile.write((message or "Not Found").encode("utf-8"))
+
+    _database_ready = False
+
+    @asynccontextmanager
+    async def _lifespan(_app):
+        global _database_ready
+        initialize()
+        _database_ready = True
+        yield
+
+    app = FastAPI(title="القادسية للتجارة · مواد خام البلاستيك", lifespan=_lifespan)
+
+    async def _dispatch(request: Request):
+        global _database_ready
+        if not _database_ready:
+            initialize()
+            _database_ready = True
+        if request.method not in ("GET", "POST"):
+            return Response(status_code=405, headers={"Allow": "GET, POST"})
+        handler = _VercelHandler(request, await request.body())
+        if request.method == "GET":
+            handler.do_GET()
+        else:
+            handler.do_POST()
+        return Response(content=handler.wfile.getvalue(), status_code=handler.response_status,
+                        headers=handler.response_headers)
+
+    app.add_api_route("/", _dispatch, methods=["GET", "POST"])
+    app.add_api_route("/{path:path}", _dispatch, methods=["GET", "POST"])
+except ImportError:
+    # The local SQLite server stays dependency-free; Vercel installs requirements.txt.
+    pass
